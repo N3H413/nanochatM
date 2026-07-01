@@ -117,17 +117,43 @@ else:
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+# # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+# tokenizer = get_tokenizer()
+# token_bytes = get_token_bytes(device=device)
+# # print(f"--- TOKEN BYTES DIAGNOSTIC ---")
+# # print(f"Total Vocab Size in Tensor: {len(token_bytes)}")
+# # print(f"Number of tokens with 0 bytes: {(token_bytes == 0).sum().item()}")
+# # print(f"Sample byte lengths for IDs 1000-1010: {token_bytes[1000:1010].tolist()}")
+# # print(f"------------------------------")
+# vocab_size = tokenizer.get_vocab_size()
+# vocab_size=201088
+# print0(f"Vocab size: {vocab_size:,}")
+
+# -----------------------------------------------------------------------------
+# Tokenizer initialization and dynamic byte-map scaling
 tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
-# print(f"--- TOKEN BYTES DIAGNOSTIC ---")
-# print(f"Total Vocab Size in Tensor: {len(token_bytes)}")
-# print(f"Number of tokens with 0 bytes: {(token_bytes == 0).sum().item()}")
-# print(f"Sample byte lengths for IDs 1000-1010: {token_bytes[1000:1010].tolist()}")
-# print(f"------------------------------")
-vocab_size = tokenizer.get_vocab_size()
-vocab_size=201088
+vocab_size = 201088
+
+print0(f"Building vocabulary byte-map for {vocab_size:,} tokens...")
+token_bytes_list = []
+for token_id in range(vocab_size):
+    try:
+        # Decode individual token ID to text string
+        token_str = tokenizer.decode([token_id])
+        # Track its true underlying raw UTF-8 byte length
+        token_bytes_list.append(len(token_str.encode('utf-8')))
+    except Exception:
+        # Fallback for special unmapped/control tokens
+        token_bytes_list.append(1)
+
+# Convert to a tensor on the correct execution device
+token_bytes = torch.tensor(token_bytes_list, dtype=torch.long, device=device)
+
+# Crucial safety check: Ensure no token registers as 0 bytes to prevent division-by-zero explosions
+token_bytes[token_bytes == 0] = 1
+
 print0(f"Vocab size: {vocab_size:,}")
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
