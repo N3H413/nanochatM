@@ -120,11 +120,11 @@ else:
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
-print(f"--- TOKEN BYTES DIAGNOSTIC ---")
-print(f"Total Vocab Size in Tensor: {len(token_bytes)}")
-print(f"Number of tokens with 0 bytes: {(token_bytes == 0).sum().item()}")
-print(f"Sample byte lengths for IDs 1000-1010: {token_bytes[1000:1010].tolist()}")
-print(f"------------------------------")
+# print(f"--- TOKEN BYTES DIAGNOSTIC ---")
+# print(f"Total Vocab Size in Tensor: {len(token_bytes)}")
+# print(f"Number of tokens with 0 bytes: {(token_bytes == 0).sum().item()}")
+# print(f"Sample byte lengths for IDs 1000-1010: {token_bytes[1000:1010].tolist()}")
+# print(f"------------------------------")
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
