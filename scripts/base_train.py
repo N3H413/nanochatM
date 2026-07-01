@@ -126,6 +126,7 @@ token_bytes = get_token_bytes(device=device)
 # print(f"Sample byte lengths for IDs 1000-1010: {token_bytes[1000:1010].tolist()}")
 # print(f"------------------------------")
 vocab_size = tokenizer.get_vocab_size()
+vocab_size=201088
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
