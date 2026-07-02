@@ -131,7 +131,11 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer initialization and dynamic byte-map scaling
+import logging
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+
 tokenizer = get_tokenizer()
+tokenizer.model_max_length = 100000  # Tell tokenizer to allow large text chunks from parquet files
 vocab_size = 201088
 
 print0(f"Building vocabulary byte-map for {vocab_size:,} tokens...")
