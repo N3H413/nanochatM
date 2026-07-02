@@ -158,3 +158,32 @@ if __name__ == "__main__":
     # Report results
     successful = sum(1 for success in results if success)
     print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+def packed_tokens_iter(split, tokenizer, block_size=512, start=0, step=1):
+    """
+    Streams raw texts from the parquet shards, tokenizes them, packs them 
+    into a continuous stream, and yields arrays of exactly block_size tokens.
+    """
+    # 1. Temporarily silence the tokenizer's internal length check warning 
+    # since we are explicitly handling the chunking safely right here.
+    import logging
+    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+    
+    buffer = []
+    
+    # 2. Stream documents from the parquet runner
+    for texts in parquets_iter_batched(split, start=start, step=step):
+        for text in texts:
+            # Tokenize the individual document into an array of IDs
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            
+            # Append the tokenizer's EOS token (e.g., <|endoftext|>) to cleanly 
+            # delimit where one document ends and the next begins in the stream.
+            if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+                tokens.append(tokenizer.eos_token_id)
+                
+            buffer.extend(tokens)
+            
+            # 3. Yield slices of exactly block_size as long as the buffer allows
+            while len(buffer) >= block_size:
+                yield buffer[:block_size]
+                buffer = buffer[block_size:]
