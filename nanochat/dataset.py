@@ -132,32 +132,6 @@ def download_single_file(index):
 
     return False
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download pretraining dataset shards")
-    parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
-    parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
-    args = parser.parse_args()
-
-    # Prepare the output directory
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    # The way this works is that the user specifies the number of train shards to download via the -n flag.
-    # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
-    num_train_shards = MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
-    ids_to_download = list(range(num_train_shards))
-    ids_to_download.append(MAX_SHARD) # always download the validation shard
-
-    # Download the shards
-    print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
-    print(f"Target directory: {DATA_DIR}")
-    print()
-    with Pool(processes=args.num_workers) as pool:
-        results = pool.map(download_single_file, ids_to_download)
-
-    # Report results
-    successful = sum(1 for success in results if success)
-    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
 def packed_tokens_iter(split, tokenizer, block_size=512, start=0, step=1):
     """
     Streams raw texts from the parquet shards, tokenizes them, packs them 
@@ -187,3 +161,30 @@ def packed_tokens_iter(split, tokenizer, block_size=512, start=0, step=1):
             while len(buffer) >= block_size:
                 yield buffer[:block_size]
                 buffer = buffer[block_size:]
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Download pretraining dataset shards")
+    parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
+    parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
+    args = parser.parse_args()
+
+    # Prepare the output directory
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # The way this works is that the user specifies the number of train shards to download via the -n flag.
+    # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
+    num_train_shards = MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
+    ids_to_download = list(range(num_train_shards))
+    ids_to_download.append(MAX_SHARD) # always download the validation shard
+
+    # Download the shards
+    print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
+    print(f"Target directory: {DATA_DIR}")
+    print()
+    with Pool(processes=args.num_workers) as pool:
+        results = pool.map(download_single_file, ids_to_download)
+
+    # Report results
+    successful = sum(1 for success in results if success)
+    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+
