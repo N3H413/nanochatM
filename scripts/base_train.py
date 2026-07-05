@@ -130,13 +130,18 @@ else:
 # print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Tokenizer initialization and dynamic byte-map scaling
 import logging
 logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
 tokenizer = get_tokenizer()
-tokenizer.model_max_length = 100000  # Tell tokenizer to allow large text chunks from parquet files
-vocab_size = 201088
+# Safe check in case RustBPETokenizer doesn't expose model_max_length
+if hasattr(tokenizer, "model_max_length"):
+    tokenizer.model_max_length = 100000  
+
+# CHANGE THIS LINE: Read dynamically from the tokenizer instead of hardcoding 201088
+vocab_size = tokenizer.get_vocab_size() 
 
 print0(f"Building vocabulary byte-map for {vocab_size:,} tokens...")
 token_bytes_list = []
