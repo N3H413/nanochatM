@@ -77,6 +77,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--tokenizer", type=str, default="tokenizer", help="Path to local tokenizer folder")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -135,7 +136,7 @@ else:
 import logging
 logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
-tokenizer = get_tokenizer()
+tokenizer = get_tokenizer(args.tokenizer)
 # Safe check in case RustBPETokenizer doesn't expose model_max_length
 if hasattr(tokenizer, "model_max_length"):
     tokenizer.model_max_length = 100000  
