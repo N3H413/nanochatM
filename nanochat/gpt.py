@@ -19,6 +19,48 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class DeepSeekEngram(nn.Module):
+    def __init__(self, d_model=384, table_size=65537, num_heads=2, d_head=64):
+        super().__init__()
+        self.table_size = table_size
+        self.num_heads = num_heads
+        self.d_head = d_head
+        
+        # Table holds bigram & trigram embeddings for all heads combined
+        self.embeddings = nn.Embedding(table_size, d_head * 2 * num_heads)
+        self.mem_proj = nn.Linear(2 * num_heads * d_head, d_model, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_model)
+        
+        # Stable weights initialization
+        nn.init.normal_(self.embeddings.weight, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.mem_proj.weight)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.zeros_(self.gate_proj.bias)
+
+    def forward(self, x, h_layer):
+        B, T = x.shape
+        device = x.device
+        primes = [131, 13331, 524287, 104729]
+        
+        # Shift tokens to obtain historical context window indices
+        x_m1 = torch.cat([torch.zeros((B, 1), dtype=x.dtype, device=device), x[:, :-1]], dim=1)
+        x_m2 = torch.cat([torch.zeros((B, 2), dtype=x.dtype, device=device), x[:, :-2]], dim=1)
+        
+        retrieved_vectors = []
+        for h in range(self.num_heads):
+            p1, p2 = primes[h*2], primes[h*2+1]
+            idx_2g = (x_m1 * p1 + x) % self.table_size
+            idx_3g = ((x_m2 * p1 + x_m1) * p2 + x) % self.table_size
+            
+            vec_2g = self.embeddings(idx_2g)[..., (h*2)*self.d_head : (h*2+1)*self.d_head]
+            vec_3g = self.embeddings(idx_3g)[..., (h*2+1)*self.d_head : (h*2+2)*self.d_head]
+            retrieved_vectors.extend([vec_2g, vec_3g])
+            
+        e_t = torch.cat(retrieved_vectors, dim=-1)
+        memory_features = self.mem_proj(e_t)
+        gate = torch.sigmoid(self.gate_proj(h_layer))
+        return h_layer + gate * memory_features
+
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
 
@@ -174,6 +216,9 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
+
+        self.engram = DeepSeekEngram(d_model=config.n_embd)
+        
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -266,6 +311,16 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+
+        # --- Initialize Engram Layers ---
+        torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)
+        torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
+        torch.nn.init.zeros_(self.engram.gate_proj.weight)
+        torch.nn.init.zeros_(self.engram.gate_proj.bias)
+
+        # Cast engram embeddings if not using float16
+        if COMPUTE_DTYPE != torch.float16:
+            self.engram.embeddings.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -427,7 +482,10 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+
+        engram_params = list(self.engram.parameters())
+        
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(engram_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -442,6 +500,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=engram_params, lr=matrix_lr * 0.5, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -500,6 +559,10 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            # INJECT ENGRAM HERE:
+            if i == 2:
+                x = self.engram(idx, x)
+            
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
