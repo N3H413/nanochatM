@@ -20,46 +20,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DeepSeekEngram(nn.Module):
-    def __init__(self, d_model=384, table_size=65537, num_heads=2, d_head=64):
+    def __init__(self, table_size=65537, embed_dim=768):
         super().__init__()
         self.table_size = table_size
-        self.num_heads = num_heads
-        self.d_head = d_head
+        self.embed = nn.Embedding(table_size, embed_dim)
         
-        # Table holds bigram & trigram embeddings for all heads combined
-        self.embeddings = nn.Embedding(table_size, d_head * 2 * num_heads)
-        self.mem_proj = nn.Linear(2 * num_heads * d_head, d_model, bias=False)
-        self.gate_proj = nn.Linear(d_model, d_model)
-        
-        # Stable weights initialization
-        nn.init.normal_(self.embeddings.weight, mean=0.0, std=0.02)
-        nn.init.xavier_uniform_(self.mem_proj.weight)
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
+        # Primes for n-gram hashing
+        self.p1 = 131
+        self.p2 = 13331
 
-    def forward(self, x, h_layer):
+    def forward(self, x, cache=None):
+        """
+        x: Tensor of shape (B, T)
+        cache: Optional dict to persist token history across generation steps
+        """
         B, T = x.shape
         device = x.device
-        primes = [131, 13331, 524287, 104729]
-        
-        # Shift tokens to obtain historical context window indices
-        x_m1 = torch.cat([torch.zeros((B, 1), dtype=x.dtype, device=device), x[:, :-1]], dim=1)
-        x_m2 = torch.cat([torch.zeros((B, 2), dtype=x.dtype, device=device), x[:, :-2]], dim=1)
-        
-        retrieved_vectors = []
-        for h in range(self.num_heads):
-            p1, p2 = primes[h*2], primes[h*2+1]
-            idx_2g = (x_m1 * p1 + x) % self.table_size
-            idx_3g = ((x_m2 * p1 + x_m1) * p2 + x) % self.table_size
+
+        # Path A: Incremental Decoding (KV-cache mode where T == 1)
+        if cache is not None and 'engram_history' in cache and T == 1:
+            past_tokens = cache['engram_history'] # Expected shape: (B, 2)
             
-            vec_2g = self.embeddings(idx_2g)[..., (h*2)*self.d_head : (h*2+1)*self.d_head]
-            vec_3g = self.embeddings(idx_3g)[..., (h*2+1)*self.d_head : (h*2+2)*self.d_head]
-            retrieved_vectors.extend([vec_2g, vec_3g])
+            x_m1 = past_tokens[:, -1:]  # Exactly 1 token back
+            x_m2 = past_tokens[:, -2:-1] # Exactly 2 tokens back
             
-        e_t = torch.cat(retrieved_vectors, dim=-1)
-        memory_features = self.mem_proj(e_t)
-        gate = torch.sigmoid(self.gate_proj(h_layer))
-        return h_layer + gate * memory_features
+            # Slide the rolling history window forward to include the new token
+            cache['engram_history'] = torch.cat([past_tokens[:, 1:], x], dim=1)
+            
+        # Path B: Training or Initial Prefill (T > 1)
+        else:
+            x_m1 = torch.cat([torch.zeros((B, 1), dtype=x.dtype, device=device), x[:, :-1]], dim=1)
+            x_m2 = torch.cat([torch.zeros((B, 2), dtype=x.dtype, device=device), x[:, :-2]], dim=1)
+            
+            # If a cache dict is provided, seed it with the end of this sequence
+            if cache is not None:
+                if T >= 2:
+                    cache['engram_history'] = x[:, -2:].clone()
+                else:
+                    # Edge case: If the prefill prompt itself is only 1 token long
+                    padding = torch.zeros((B, 1), dtype=x.dtype, device=device)
+                    cache['engram_history'] = torch.cat([padding, x], dim=1)
+
+        # Compute hashes safely—all tensors now share the exact same shape (B, T)
+        bigram_hash = (x_m1 * self.p1 + x) % self.table_size
+        trigram_hash = (x_m2 * self.p2 + bigram_hash) % self.table_size
+
+        # Look up and fuse local context embeddings
+        return self.embed(bigram_hash) + self.embed(trigram_hash)
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -561,7 +568,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             # INJECT ENGRAM HERE:
             if i == 2:
-                x = self.engram(idx, x)
+                x = self.engram(idx, x, kv_cache=kv_cache)
             
             if i == backout_layer:
                 x_backout = x
