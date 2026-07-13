@@ -608,18 +608,31 @@ while True:
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+        # Safeguard: Only allow main process (rank 0) to write to file to prevent multi-GPU corruption
+        if 'ddp_rank' not in locals() or ddp_rank == 0:
+            import json
+            import os
+            
+            log_data = {
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "total_training_time": total_training_time,
+                "train/loss": debiased_smooth_loss,
+                "train/lrm": lrm,
+                "train/dt": dt,
+                "train/tok_per_sec": tok_per_sec,
+                "train/mfu": mfu,
+                "train/epoch": epoch,
+            }
+            
+            # Map directly to your system cache directory so the background watcher uploads it
+            metrics_dir = "/root/.cache/nanochat/base_checkpoints/d12"
+            os.makedirs(metrics_dir, exist_ok=True)
+            metrics_path = os.path.join(metrics_dir, "metrics.jsonl")
+            
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(log_data) + "\n")
+                
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
