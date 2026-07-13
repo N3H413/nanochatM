@@ -469,12 +469,20 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
+        
+        # Log validation metrics directly to JSONL file instead of W&B
+        if 'ddp_rank' not in locals() or ddp_rank == 0:
+            import json
+            import os
+            metrics_dir = "/root/.cache/nanochat/base_checkpoints/d12"
+            os.makedirs(metrics_dir, exist_ok=True)
+            with open(os.path.join(metrics_dir, "metrics.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "step": step,
+                    "total_training_flops": flops_so_far,
+                    "total_training_time": total_training_time,
+                    "val/bpb": val_bpb,
+                }) + "\n")
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -486,14 +494,22 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+        
+        # Log core metrics directly to JSONL file instead of W&B
+        if 'ddp_rank' not in locals() or ddp_rank == 0:
+            import json
+            import os
+            metrics_dir = "/root/.cache/nanochat/base_checkpoints/d12"
+            os.makedirs(metrics_dir, exist_ok=True)
+            with open(os.path.join(metrics_dir, "metrics.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "step": step,
+                    "total_training_flops": flops_so_far,
+                    "core_metric": results["core_metric"],
+                    "centered_results": results["centered_results"],
+                }) + "\n")
         model.train()
-
+        
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
