@@ -89,7 +89,6 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
         num_queries_per_kv = q.size(1) // k.size(1)
         k = torch.repeat_interleave(k, num_queries_per_kv, dim=1)
         v = torch.repeat_interleave(v, num_queries_per_kv, dim=1)
-        enable_gqa = False  # Head counts now match; set to False to bypass SDPA internals
     # ---------------------------
     
     Tq = q.size(2)
@@ -98,7 +97,8 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        # enable_gqa parameter removed for backwards-compatibility
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     # Single token generation
     if Tq == 1:
@@ -107,7 +107,8 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             start = max(0, Tk - (window + 1))
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        # enable_gqa parameter removed for backwards-compatibility
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     # Need explicit mask for sliding window/chunk inference
     device = q.device
@@ -120,7 +121,8 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
 
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    # enable_gqa parameter removed for backwards-compatibility
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
 # =============================================================================
 # Public API: Same interface as FA3
