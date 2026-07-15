@@ -81,6 +81,16 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     k = k.to(dtype=q.dtype)
     v = v.to(dtype=q.dtype)
+
+    # --- DEFENSIVE GQA PATCH ---
+    # If GQA is active, manually expand key/value heads to match query heads.
+    # This prevents TypeErrors on older PyTorch versions and avoids mask conflicts!
+    if enable_gqa:
+        num_queries_per_kv = q.size(1) // k.size(1)
+        k = torch.repeat_interleave(k, num_queries_per_kv, dim=1)
+        v = torch.repeat_interleave(v, num_queries_per_kv, dim=1)
+        enable_gqa = False  # Head counts now match; set to False to bypass SDPA internals
+    # ---------------------------
     
     Tq = q.size(2)
     Tk = k.size(2)
