@@ -79,6 +79,9 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
     """
+    k = k.to(dtype=q.dtype)
+    v = v.to(dtype=q.dtype)
+    
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
