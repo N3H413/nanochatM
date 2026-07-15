@@ -243,6 +243,16 @@ class Engine:
             token_column = [] # contains the next token id along each row
             token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
             for i, state in enumerate(row_states):
+                # --- ZOMBIE BYPASS FIX ---
+                if state.completed:
+                    # Feed a harmless end token to keep batch shapes aligned,
+                    # but skip sampling and side-effect tool executions completely!
+                    next_token = assistant_end
+                    token_masks.append(0)
+                    token_column.append(next_token)
+                    state.current_tokens.append(next_token)
+                    continue
+
                 # Select the next token in this row
                 is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
                 token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
