@@ -20,53 +20,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DeepSeekEngram(nn.Module):
-    def __init__(self, table_size=65537, embed_dim=768):
+    def __init__(self, table_size=65537, d_model=768):
         super().__init__()
         self.table_size = table_size
-        self.embed = nn.Embedding(table_size, embed_dim)
-        
-        # Primes for n-gram hashing
+        # Named exactly as expected by the trunk model's weight initialization routine
+        self.embeddings = nn.Embedding(table_size, d_model)
+        self.mem_proj = nn.Linear(d_model, d_model, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_model)
         self.p1 = 131
         self.p2 = 13331
 
-    def forward(self, x, cache=None):
-        """
-        x: Tensor of shape (B, T)
-        cache: Optional dict to persist token history across generation steps
-        """
-        B, T = x.shape
-        device = x.device
+    def forward(self, idx, h_layer, kv_cache=None):
+        B, T = idx.shape
+        device = idx.device
 
-        # Path A: Incremental Decoding (KV-cache mode where T == 1)
-        if cache is not None and 'engram_history' in cache and T == 1:
-            past_tokens = cache['engram_history'] # Expected shape: (B, 2)
-            
-            x_m1 = past_tokens[:, -1:]  # Exactly 1 token back
-            x_m2 = past_tokens[:, -2:-1] # Exactly 2 tokens back
-            
-            # Slide the rolling history window forward to include the new token
-            cache['engram_history'] = torch.cat([past_tokens[:, 1:], x], dim=1)
-            
-        # Path B: Training or Initial Prefill (T > 1)
-        else:
-            x_m1 = torch.cat([torch.zeros((B, 1), dtype=x.dtype, device=device), x[:, :-1]], dim=1)
-            x_m2 = torch.cat([torch.zeros((B, 2), dtype=x.dtype, device=device), x[:, :-2]], dim=1)
-            
-            # If a cache dict is provided, seed it with the end of this sequence
-            if cache is not None:
-                if T >= 2:
-                    cache['engram_history'] = x[:, -2:].clone()
+        # Track rolling token histories across generation boundaries when cache is enabled
+        if kv_cache is not None:
+            if not hasattr(kv_cache, 'engram_history'):
+                kv_cache.engram_history = idx
+            else:
+                if T == 1:
+                    kv_cache.engram_history = torch.cat([kv_cache.engram_history, idx], dim=1)
                 else:
-                    # Edge case: If the prefill prompt itself is only 1 token long
-                    padding = torch.zeros((B, 1), dtype=x.dtype, device=device)
-                    cache['engram_history'] = torch.cat([padding, x], dim=1)
+                    kv_cache.engram_history = idx
+            full_idx = kv_cache.engram_history
+        else:
+            full_idx = idx
 
-        # Compute hashes safely—all tensors now share the exact same shape (B, T)
-        bigram_hash = (x_m1 * self.p1 + x) % self.table_size
-        trigram_hash = (x_m2 * self.p2 + bigram_hash) % self.table_size
+        # Compute sliding context windows
+        idx_m1 = torch.cat([torch.zeros((B, 1), dtype=full_idx.dtype, device=device), full_idx[:, :-1]], dim=1)
+        idx_m2 = torch.cat([torch.zeros((B, 2), dtype=full_idx.dtype, device=device), full_idx[:, :-2]], dim=1)
 
-        # Look up and fuse local context embeddings
-        return self.embed(bigram_hash) + self.embed(trigram_hash)
+        # Truncate sequences to match the active calculation token length (T)
+        current_idx = full_idx[:, -T:]
+        current_m1 = idx_m1[:, -T:]
+        current_m2 = idx_m2[:, -T:]
+
+        bigram_hash = (current_m1 * self.p1 + current_idx) % self.table_size
+        trigram_hash = (current_m2 * self.p2 + bigram_hash) % self.table_size
+
+        # Combine lookup projections and mix features using a gated activation stream
+        e_t = self.embeddings(bigram_hash) + self.embeddings(trigram_hash)
+        memory_features = self.mem_proj(e_t)
+        gate = torch.sigmoid(self.gate_proj(h_layer))
+        return h_layer + gate * memory_features
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -96,7 +93,8 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(dtype=x.dtype), bias)
 
 
 def has_ve(layer_idx, n_layer):
@@ -467,7 +465,7 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + sum(p.numel() for p in self.engram.parameters())
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -526,7 +524,13 @@ class GPT(nn.Module):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        if T > self.cos.size(1):
+            repeats = (T // self.cos.size(1)) + 1
+            repeat_sizes = [1] * self.cos.dim()
+            repeat_sizes[1] = repeats
+            self.cos = self.cos.repeat(*repeat_sizes)
+            self.sin = self.sin.repeat(*repeat_sizes)
+            
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
