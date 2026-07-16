@@ -20,21 +20,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DeepSeekEngram(nn.Module):
-    def __init__(self, table_size=65537, d_model=768):
+    def __init__(self, table_size=65537, d_model=768, vocab_size=32768, noise_floor=0.25):
         super().__init__()
         self.table_size = table_size
-        # Named exactly as expected by the trunk model's weight initialization routine
+        self.noise_floor = noise_floor
+        
+        # Fixed: Changed nn.Linear to the custom local Linear class
         self.embeddings = nn.Embedding(table_size, d_model)
-        self.mem_proj = nn.Linear(d_model, d_model, bias=False)
-        self.gate_proj = nn.Linear(d_model, d_model)
+        self.mem_proj = Linear(d_model, d_model, bias=False)
+        self.gate_proj = Linear(d_model, d_model)
         self.p1 = 131
         self.p2 = 13331
+
+        # Fixed: Allocate a placeholder on the meta device context first
+        self.register_buffer("token_idf", torch.ones(vocab_size), persistent=False)
+
+    @torch.no_grad()
+    def load_idf(self, idf_path="idf_weights.pt"):
+        """Safely loads concrete weights during the weight initialization phase phase."""
+        import os
+        if os.path.exists(idf_path):
+            idf_weights = torch.load(idf_path, map_location=self.token_idf.device)
+            # Safe padding match in case the loaded vocabulary is smaller than the padded matrix space
+            if idf_weights.shape[0] < self.token_idf.shape[0]:
+                padding = torch.ones(self.token_idf.shape[0] - idf_weights.shape[0], device=idf_weights.device)
+                idf_weights = torch.cat([idf_weights, padding], dim=0)
+            self.token_idf.copy_(idf_weights[:self.token_idf.shape[0]])
+        else:
+            print(f"⚠️ Warning: {idf_path} not found. Initializing with uniform weights.")
+            self.token_idf.fill_(1.0)
 
     def forward(self, idx, h_layer, kv_cache=None):
         B, T = idx.shape
         device = idx.device
 
-        # Track rolling token histories across generation boundaries when cache is enabled
         if kv_cache is not None:
             if not hasattr(kv_cache, 'engram_history'):
                 kv_cache.engram_history = idx
@@ -47,21 +66,31 @@ class DeepSeekEngram(nn.Module):
         else:
             full_idx = idx
 
-        # Compute sliding context windows
         idx_m1 = torch.cat([torch.zeros((B, 1), dtype=full_idx.dtype, device=device), full_idx[:, :-1]], dim=1)
         idx_m2 = torch.cat([torch.zeros((B, 2), dtype=full_idx.dtype, device=device), full_idx[:, :-2]], dim=1)
 
-        # Truncate sequences to match the active calculation token length (T)
         current_idx = full_idx[:, -T:]
         current_m1 = idx_m1[:, -T:]
         current_m2 = idx_m2[:, -T:]
 
+        # --- HYBRID TF-IDF GATING MASK ---
+        current_idf = self.token_idf[current_idx].unsqueeze(-1)
+        shifted_idf = torch.clamp(current_idf - self.noise_floor, min=0.0)
+        scale_factor = 1.0 - self.noise_floor
+        scaled_idf = shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)
+        
+        # Fixed: Cast the mask to match activation precision to prevent fp32 upcasting leaks
+        scaled_idf = scaled_idf.to(dtype=h_layer.dtype)
+
         bigram_hash = (current_m1 * self.p1 + current_idx) % self.table_size
         trigram_hash = (current_m2 * self.p2 + bigram_hash) % self.table_size
 
-        # Combine lookup projections and mix features using a gated activation stream
         e_t = self.embeddings(bigram_hash) + self.embeddings(trigram_hash)
         memory_features = self.mem_proj(e_t)
+        
+        # Apply precision-aligned gating mask
+        memory_features = memory_features * scaled_idf
+        
         gate = torch.sigmoid(self.gate_proj(h_layer))
         return h_layer + gate * memory_features
 
@@ -222,7 +251,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
 
-        self.engram = DeepSeekEngram(d_model=config.n_embd)
+        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size)        
         
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -323,6 +352,7 @@ class GPT(nn.Module):
         torch.nn.init.zeros_(self.engram.gate_proj.weight)
         torch.nn.init.zeros_(self.engram.gate_proj.bias)
 
+        self.engram.load_idf("idf_weights.pt")
         # Cast engram embeddings if not using float16
         if COMPUTE_DTYPE != torch.float16:
             self.engram.embeddings.to(dtype=COMPUTE_DTYPE)
