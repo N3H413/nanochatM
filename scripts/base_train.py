@@ -49,6 +49,7 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--n-kv-head", type=int, default=-1, help="Number of key/value heads for GQA (-1 defaults to matching n_head)")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -175,9 +176,11 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+
+    n_kv_head = args.n_kv_head if args.n_kv_head != -1 else num_heads
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
