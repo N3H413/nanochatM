@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 class DeepSeekEngram(nn.Module):
     def __init__(self, table_size=65537, d_model=384, vocab_size=32768, noise_floor=0.25, idf_path="idf_weights.pt"):
