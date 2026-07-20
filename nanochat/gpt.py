@@ -20,40 +20,46 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DeepSeekEngram(nn.Module):
-    def __init__(self, table_size=65537, d_model=768, vocab_size=32768, noise_floor=0.25):
+    def __init__(self, table_size=65537, d_model=384, vocab_size=32768, noise_floor=0.25, idf_path="idf_weights.pt"):
         super().__init__()
         self.table_size = table_size
         self.noise_floor = noise_floor
         
-        # Fixed: Changed nn.Linear to the custom local Linear class
         self.embeddings = nn.Embedding(table_size, d_model)
         self.mem_proj = Linear(d_model, d_model, bias=False)
         self.gate_proj = Linear(d_model, d_model)
         self.p1 = 131
         self.p2 = 13331
 
-        # Fixed: Allocate a placeholder on the meta device context first
+        # Register buffer placeholder
         self.register_buffer("token_idf", torch.ones(vocab_size), persistent=False)
+        
+        # FIX 1: Automatically load IDF weights upon class instantiation
+        self.load_idf(idf_path)
 
     @torch.no_grad()
     def load_idf(self, idf_path="idf_weights.pt"):
-        """Safely loads concrete weights during the weight initialization phase phase."""
-        import os
+        """Safely loads concrete weights and handles padded vocabulary alignment."""
         if os.path.exists(idf_path):
             idf_weights = torch.load(idf_path, map_location=self.token_idf.device)
-            # Safe padding match in case the loaded vocabulary is smaller than the padded matrix space
-            if idf_weights.shape[0] < self.token_idf.shape[0]:
-                padding = torch.ones(self.token_idf.shape[0] - idf_weights.shape[0], device=idf_weights.device)
+            
+            # FIX 2: Pad token_idf to match padded vocab size (e.g., 32832)
+            target_len = self.token_idf.shape[0]
+            if idf_weights.shape[0] < target_len:
+                padding = torch.zeros(target_len - idf_weights.shape[0], device=idf_weights.device)
                 idf_weights = torch.cat([idf_weights, padding], dim=0)
-            self.token_idf.copy_(idf_weights[:self.token_idf.shape[0]])
+            
+            self.token_idf.copy_(idf_weights[:target_len])
+            print(f"✓ [Engram] Loaded TF-IDF weights from '{idf_path}' (Noise Floor: {self.noise_floor})")
         else:
-            print(f"⚠️ Warning: {idf_path} not found. Initializing with uniform weights.")
+            print(f"⚠️ Warning: '{idf_path}' not found. Initializing with uniform weights (1.0).")
             self.token_idf.fill_(1.0)
 
     def forward(self, idx, h_layer, kv_cache=None):
         B, T = idx.shape
         device = idx.device
 
+        # Handle KV Cache context history during generation passes
         if kv_cache is not None:
             if not hasattr(kv_cache, 'engram_history'):
                 kv_cache.engram_history = idx
@@ -79,16 +85,17 @@ class DeepSeekEngram(nn.Module):
         scale_factor = 1.0 - self.noise_floor
         scaled_idf = shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)
         
-        # Fixed: Cast the mask to match activation precision to prevent fp32 upcasting leaks
+        # Cast mask to match activation precision (bf16/fp16)
         scaled_idf = scaled_idf.to(dtype=h_layer.dtype)
 
+        # Bigram and Trigram hashing
         bigram_hash = (current_m1 * self.p1 + current_idx) % self.table_size
         trigram_hash = (current_m2 * self.p2 + bigram_hash) % self.table_size
 
         e_t = self.embeddings(bigram_hash) + self.embeddings(trigram_hash)
         memory_features = self.mem_proj(e_t)
         
-        # Apply precision-aligned gating mask
+        # Zero-out features for fluff/stop words below noise floor
         memory_features = memory_features * scaled_idf
         
         gate = torch.sigmoid(self.gate_proj(h_layer))
