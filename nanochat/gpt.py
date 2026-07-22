@@ -305,55 +305,44 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
+   @torch.no_grad()
     def init_weights(self):
         """
         Initialize the full model in this one function for maximum clarity.
-
-        wte (embedding):     normal, std=1.0
-        lm_head:             normal, std=0.001
-        for each block:
-            attn.c_q:        uniform, std=1/sqrt(n_embd)
-            attn.c_k:        uniform, std=1/sqrt(n_embd)
-            attn.c_v:        uniform, std=1/sqrt(n_embd)
-            attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
         """
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-        # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
+        # Transformer blocks: uniform init with bound = sqrt(3) * std
         n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
-        # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
         for i in range(n_layer):
             self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Smear/backout scalars and smear gate must be explicitly initialized 
+        # Smear/backout scalars and smear gate
         torch.nn.init.zeros_(self.smear_lambda)
         torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-        # Value embeddings (init like c_v: uniform with same std)
+        # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
 
-        # Gate weights init with small positive values so gates start slightly above neutral
+        # Gate weights
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
@@ -363,31 +352,31 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
-        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
-        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
-        # because GradScaler cannot unscale fp16 gradients.
-        if COMPUTE_DTYPE != torch.float16:
-            self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
-
-        # --- Initialize Engram Layers ---
-        # NEW INITIALIZATION LOGIC
+        # Initialize Engram module completely inside safety guard
         if hasattr(self, "engram") and self.engram is not None:
             if hasattr(self.engram, "unigram_embd"):
                 torch.nn.init.normal_(self.engram.unigram_embd.weight, mean=0.0, std=0.02)
                 torch.nn.init.normal_(self.engram.bigram_embd.weight, mean=0.0, std=0.02)
                 torch.nn.init.normal_(self.engram.trigram_embd.weight, mean=0.0, std=0.02)
             elif hasattr(self.engram, "embeddings"):
-                torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)        
-        torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
-        torch.nn.init.zeros_(self.engram.gate_proj.weight)
-        torch.nn.init.zeros_(self.engram.gate_proj.bias)
+                torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)
 
-        self.engram.load_idf("idf_weights.pt")
-        # Cast engram embeddings if not using float16
-        if COMPUTE_DTYPE != torch.float16:
-            self.engram.embeddings.to(dtype=COMPUTE_DTYPE)
+            torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
+            torch.nn.init.zeros_(self.engram.gate_proj.weight)
+            torch.nn.init.zeros_(self.engram.gate_proj.bias)
+
+            # Load IDF weights if method exists
+            if hasattr(self.engram, "load_idf"):
+                self.engram.load_idf("idf_weights.pt")
+
+            # Cast Engram embeddings if not using float16
+            if COMPUTE_DTYPE != torch.float16:
+                if hasattr(self.engram, "unigram_embd"):
+                    self.engram.unigram_embd.to(dtype=COMPUTE_DTYPE)
+                    self.engram.bigram_embd.to(dtype=COMPUTE_DTYPE)
+                    self.engram.trigram_embd.to(dtype=COMPUTE_DTYPE)
+                elif hasattr(self.engram, "embeddings"):
+                    self.engram.embeddings.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -633,7 +622,7 @@ class GPT(nn.Module):
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             # INJECT ENGRAM HERE:
-            if i == 2:
+            if i == 2 and hasattr(self, "engram") and self.engram is not None:
                 x = self.engram(idx, x, kv_cache=kv_cache)
             
             if i == backout_layer:
