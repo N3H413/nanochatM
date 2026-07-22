@@ -372,7 +372,14 @@ class GPT(nn.Module):
                 ve.to(dtype=COMPUTE_DTYPE)
 
         # --- Initialize Engram Layers ---
-        torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)
+        # NEW INITIALIZATION LOGIC
+        if hasattr(self, "engram") and self.engram is not None:
+            if hasattr(self.engram, "unigram_embd"):
+                torch.nn.init.normal_(self.engram.unigram_embd.weight, mean=0.0, std=0.02)
+                torch.nn.init.normal_(self.engram.bigram_embd.weight, mean=0.0, std=0.02)
+                torch.nn.init.normal_(self.engram.trigram_embd.weight, mean=0.0, std=0.02)
+            elif hasattr(self.engram, "embeddings"):
+                torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)        
         torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
         torch.nn.init.zeros_(self.engram.gate_proj.weight)
         torch.nn.init.zeros_(self.engram.gate_proj.bias)
