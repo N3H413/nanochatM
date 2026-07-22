@@ -21,21 +21,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DeepSeekEngram(nn.Module):
-    def __init__(self, table_size=65537, d_model=384, vocab_size=32768, noise_floor=0.25, idf_path="idf_weights.pt"):
+    def __init__(self, table_size=65537, d_model=384, vocab_size=32768, noise_floor=0.15, idf_path="idf_weights.pt"):
         super().__init__()
         self.table_size = table_size
         self.noise_floor = noise_floor
+        self.d_model = d_model
         
-        self.embeddings = nn.Embedding(table_size, d_model)
-        self.mem_proj = Linear(d_model, d_model, bias=False)
-        self.gate_proj = Linear(d_model, d_model)
+        # 1. Separate embedding tables per N-gram order to prevent hash collision
+        self.unigram_embd = nn.Embedding(vocab_size, d_model)
+        self.bigram_embd  = nn.Embedding(table_size, d_model)
+        self.trigram_embd = nn.Embedding(table_size, d_model)
+        
+        # Linear projections & gating
+        self.mem_proj  = nn.Linear(d_model, d_model, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_model)
+        
+        # Prime multipliers for rolling hash
         self.p1 = 131
         self.p2 = 13331
 
-        # Register buffer placeholder
+        # Register buffer for Unigram IDF
         self.register_buffer("token_idf", torch.ones(vocab_size), persistent=False)
-        
-        # FIX 1: Automatically load IDF weights upon class instantiation
         self.load_idf(idf_path)
 
     @torch.no_grad()
@@ -43,8 +49,6 @@ class DeepSeekEngram(nn.Module):
         """Safely loads concrete weights and handles padded vocabulary alignment."""
         if os.path.exists(idf_path):
             idf_weights = torch.load(idf_path, map_location=self.token_idf.device)
-            
-            # FIX 2: Pad token_idf to match padded vocab size (e.g., 32832)
             target_len = self.token_idf.shape[0]
             if idf_weights.shape[0] < target_len:
                 padding = torch.zeros(target_len - idf_weights.shape[0], device=idf_weights.device)
@@ -60,7 +64,7 @@ class DeepSeekEngram(nn.Module):
         B, T = idx.shape
         device = idx.device
 
-        # Handle KV Cache context history during generation passes
+        # Handle KV Cache context history during generation
         if kv_cache is not None:
             if not hasattr(kv_cache, 'engram_history'):
                 kv_cache.engram_history = idx
@@ -73,33 +77,46 @@ class DeepSeekEngram(nn.Module):
         else:
             full_idx = idx
 
+        # Prepend zeros for sliding context windows
         idx_m1 = torch.cat([torch.zeros((B, 1), dtype=full_idx.dtype, device=device), full_idx[:, :-1]], dim=1)
         idx_m2 = torch.cat([torch.zeros((B, 2), dtype=full_idx.dtype, device=device), full_idx[:, :-2]], dim=1)
 
         current_idx = full_idx[:, -T:]
-        current_m1 = idx_m1[:, -T:]
-        current_m2 = idx_m2[:, -T:]
+        current_m1  = idx_m1[:, -T:]
+        current_m2  = idx_m2[:, -T:]
 
-        # --- HYBRID TF-IDF GATING MASK ---
-        current_idf = self.token_idf[current_idx].unsqueeze(-1)
-        shifted_idf = torch.clamp(current_idf - self.noise_floor, min=0.0)
-        scale_factor = 1.0 - self.noise_floor
-        scaled_idf = shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)
-        
-        # Cast mask to match activation precision (bf16/fp16)
-        scaled_idf = scaled_idf.to(dtype=h_layer.dtype)
-
-        # Bigram and Trigram hashing
-        bigram_hash = (current_m1 * self.p1 + current_idx) % self.table_size
+        # --- N-GRAM HASH COMPUTATION ---
+        bigram_hash  = (current_m1 * self.p1 + current_idx) % self.table_size
         trigram_hash = (current_m2 * self.p2 + bigram_hash) % self.table_size
 
-        e_t = self.embeddings(bigram_hash) + self.embeddings(trigram_hash)
+        # Retrieve embeddings across orders (N=1, 2, 3)
+        e_1gram = self.unigram_embd(current_idx)
+        e_2gram = self.bigram_embd(bigram_hash)
+        e_3gram = self.trigram_embd(trigram_hash)
+
+        # Sum N-gram embeddings
+        e_t = e_1gram + e_2gram + e_3gram
         memory_features = self.mem_proj(e_t)
+
+        # --- MAX-POOLED N-GRAM IDF MASK ---
+        # Instead of using only current_idx IDF, pool IDF across the window
+        # so ('log', 'it') takes max(IDF('log'), IDF('it'))
+        idf_0 = self.token_idf[current_idx]
+        idf_1 = self.token_idf[current_m1]
+        idf_2 = self.token_idf[current_m2]
         
-        # Zero-out features for fluff/stop words below noise floor
+        pooled_idf = torch.maximum(idf_0, torch.maximum(idf_1, idf_2)).unsqueeze(-1)
+        
+        shifted_idf = torch.clamp(pooled_idf - self.noise_floor, min=0.0)
+        scale_factor = 1.0 - self.noise_floor
+        scaled_idf = (shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)).to(dtype=h_layer.dtype)
+
+        # Apply IDF prior scale
         memory_features = memory_features * scaled_idf
-        
+
+        # Context-aware sigmoid gating
         gate = torch.sigmoid(self.gate_proj(h_layer))
+        
         return h_layer + gate * memory_features
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
