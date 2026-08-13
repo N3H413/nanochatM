@@ -27,34 +27,35 @@ class DeepSeekEngram(nn.Module):
         self.noise_floor = noise_floor
         self.d_model = d_model
         
-        # 1. Separate embedding tables per N-gram order to prevent hash collision
+        # 1. N-gram embedding tables
         self.unigram_embd = nn.Embedding(vocab_size, d_model)
         self.bigram_embd  = nn.Embedding(table_size, d_model)
         self.trigram_embd = nn.Embedding(table_size, d_model)
         
-        # Linear projections & gating
-        self.mem_proj  = nn.Linear(d_model, d_model, bias=False)
-        self.gate_proj = nn.Linear(d_model, d_model)
+        # Use custom Linear class (handles weight casting automatically)
+        self.mem_proj  = Linear(d_model, d_model, bias=False)
+        self.gate_proj = Linear(d_model, d_model)
         
         # Prime multipliers for rolling hash
         self.p1 = 131
         self.p2 = 13331
 
-        # Register buffer for Unigram IDF
+        # Buffer for Unigram IDF
         self.register_buffer("token_idf", torch.ones(vocab_size), persistent=False)
-        self.load_idf(idf_path)
 
     @torch.no_grad()
     def load_idf(self, idf_path="idf_weights.pt"):
-        """Safely loads concrete weights and handles padded vocabulary alignment."""
+        if self.token_idf.device.type == "meta":
+            return
+            
         if os.path.exists(idf_path):
-            idf_weights = torch.load(idf_path, map_location=self.token_idf.device)
+            idf_weights = torch.load(idf_path, map_location="cpu")
             target_len = self.token_idf.shape[0]
             if idf_weights.shape[0] < target_len:
-                padding = torch.zeros(target_len - idf_weights.shape[0], device=idf_weights.device)
+                padding = torch.zeros(target_len - idf_weights.shape[0])
                 idf_weights = torch.cat([idf_weights, padding], dim=0)
             
-            self.token_idf.copy_(idf_weights[:target_len])
+            self.token_idf.copy_(idf_weights[:target_len].to(self.token_idf.device))
             print(f"✓ [Engram] Loaded TF-IDF weights from '{idf_path}' (Noise Floor: {self.noise_floor})")
         else:
             print(f"⚠️ Warning: '{idf_path}' not found. Initializing with uniform weights (1.0).")
@@ -65,7 +66,6 @@ class DeepSeekEngram(nn.Module):
         B, T = idx.shape
         device = idx.device
 
-        # Handle KV Cache context history during generation
         if kv_cache is not None:
             if not hasattr(kv_cache, 'engram_history'):
                 kv_cache.engram_history = idx
@@ -78,7 +78,7 @@ class DeepSeekEngram(nn.Module):
         else:
             full_idx = idx
 
-        # Prepend zeros for sliding context windows
+        # Prepend zeros for context windows
         idx_m1 = torch.cat([torch.zeros((B, 1), dtype=full_idx.dtype, device=device), full_idx[:, :-1]], dim=1)
         idx_m2 = torch.cat([torch.zeros((B, 2), dtype=full_idx.dtype, device=device), full_idx[:, :-2]], dim=1)
 
@@ -86,41 +86,28 @@ class DeepSeekEngram(nn.Module):
         current_m1  = idx_m1[:, -T:]
         current_m2  = idx_m2[:, -T:]
 
-        # --- N-GRAM HASH COMPUTATION ---
+        # N-Gram rolling hash computation
         bigram_hash  = (current_m1 * self.p1 + current_idx) % self.table_size
         trigram_hash = (current_m2 * self.p2 + bigram_hash) % self.table_size
 
-        # Retrieve embeddings across orders (N=1, 2, 3)
         e_1gram = self.unigram_embd(current_idx)
         e_2gram = self.bigram_embd(bigram_hash)
         e_3gram = self.trigram_embd(trigram_hash)
 
-        # Sum N-gram embeddings and cast to activation dtype
         e_t = (e_1gram + e_2gram + e_3gram).to(dtype=dtype)
-
-        # Ensure linear projections match activation dtype
-        if self.mem_proj.weight.dtype != dtype:
-            self.mem_proj = self.mem_proj.to(dtype)
-        if self.gate_proj.weight.dtype != dtype:
-            self.gate_proj = self.gate_proj.to(dtype)
-
         memory_features = self.mem_proj(e_t)
 
-        # --- MAX-POOLED N-GRAM IDF MASK ---
+        # IDF Filtering & Masking
         idf_0 = self.token_idf[current_idx]
         idf_1 = self.token_idf[current_m1]
         idf_2 = self.token_idf[current_m2]
         
         pooled_idf = torch.maximum(idf_0, torch.maximum(idf_1, idf_2)).unsqueeze(-1)
-        
         shifted_idf = torch.clamp(pooled_idf - self.noise_floor, min=0.0)
         scale_factor = 1.0 - self.noise_floor
         scaled_idf = (shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)).to(dtype=dtype)
 
-        # Apply IDF prior scale
         memory_features = memory_features * scaled_idf
-
-        # Context-aware sigmoid gating
         gate = torch.sigmoid(self.gate_proj(h_layer))
         
         return h_layer + gate * memory_features
@@ -310,82 +297,71 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
-    @torch.no_grad()
-    def init_weights(self):
-        """
-        Initialize the full model in this one function for maximum clarity.
-        """
+@torch.no_grad()
+def init_weights(self):
+    """
+    Initialize the full model in this one function for maximum clarity.
+    """
+    # Embedding and unembedding
+    torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
+    torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+    # Transformer blocks: uniform init with bound = sqrt(3) * std
+    n_embd = self.config.n_embd
+    s = 3**0.5 * n_embd**-0.5
+    for block in self.transformer.h:
+        torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+        torch.nn.init.zeros_(block.attn.c_proj.weight)
+        torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
-        # Transformer blocks: uniform init with bound = sqrt(3) * std
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+    # Per-layer scalars
+    n_layer = self.config.n_layer
+    for i in range(n_layer):
+        self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+    for i in range(n_layer):
+        self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Per-layer scalars
-        n_layer = self.config.n_layer
-        for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+    # Smear/backout scalars and smear gate
+    torch.nn.init.zeros_(self.smear_lambda)
+    torch.nn.init.constant_(self.backout_lambda, 0.2)
+    torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-        # Smear/backout scalars and smear gate
-        torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+    # Value embeddings
+    for ve in self.value_embeds.values():
+        torch.nn.init.uniform_(ve.weight, -s, s)
 
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+    # Gate weights
+    for block in self.transformer.h:
+        if block.attn.ve_gate is not None:
+            torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
-        # Gate weights
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+    # Rotary embeddings
+    head_dim = self.config.n_embd // self.config.n_head
+    cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+    self.cos, self.sin = cos, sin
 
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+    # Initialize Engram module
+    if hasattr(self, "engram") and self.engram is not None:
+        if hasattr(self.engram, "unigram_embd"):
+            torch.nn.init.normal_(self.engram.unigram_embd.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(self.engram.bigram_embd.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(self.engram.trigram_embd.weight, mean=0.0, std=0.02)
+        elif hasattr(self.engram, "embeddings"):
+            torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)
 
-        # Initialize Engram module completely inside safety guard
-        if hasattr(self, "engram") and self.engram is not None:
-            if hasattr(self.engram, "unigram_embd"):
-                torch.nn.init.normal_(self.engram.unigram_embd.weight, mean=0.0, std=0.02)
-                torch.nn.init.normal_(self.engram.bigram_embd.weight, mean=0.0, std=0.02)
-                torch.nn.init.normal_(self.engram.trigram_embd.weight, mean=0.0, std=0.02)
-            elif hasattr(self.engram, "embeddings"):
-                torch.nn.init.normal_(self.engram.embeddings.weight, mean=0.0, std=0.02)
+        torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
+        torch.nn.init.zeros_(self.engram.gate_proj.weight)
+        
+        # Initialize gate bias to negative value so gate starts near 0 (~0.11)
+        if self.engram.gate_proj.bias is not None:
+            torch.nn.init.constant_(self.engram.gate_proj.bias, -2.0)
 
-            torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
-            torch.nn.init.zeros_(self.engram.gate_proj.weight)
-            torch.nn.init.zeros_(self.engram.gate_proj.bias)
-
-            # Cast linear projection layers in Engram to COMPUTE_DTYPE
-            self.engram.mem_proj.to(dtype=COMPUTE_DTYPE)
-            self.engram.gate_proj.to(dtype=COMPUTE_DTYPE)
-
-            # Load IDF weights if method exists
-            if hasattr(self.engram, "load_idf"):
-                self.engram.load_idf("idf_weights.pt")
-
-            # Cast Engram embeddings if not using float16
-            if COMPUTE_DTYPE != torch.float16:
-                if hasattr(self.engram, "unigram_embd"):
-                    self.engram.unigram_embd.to(dtype=COMPUTE_DTYPE)
-                    self.engram.bigram_embd.to(dtype=COMPUTE_DTYPE)
-                    self.engram.trigram_embd.to(dtype=COMPUTE_DTYPE)
-                elif hasattr(self.engram, "embeddings"):
-                    self.engram.embeddings.to(dtype=COMPUTE_DTYPE)
+        # Load IDF weights
+        if hasattr(self.engram, "load_idf"):
+            self.engram.load_idf("idf_weights.pt")
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -536,49 +512,73 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
-        model_dim = self.config.n_embd
+def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    model_dim = self.config.n_embd
 
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+    # Separate out all standard parameters into groups
+    matrix_params = list(self.transformer.h.parameters())
+    value_embeds_params = list(self.value_embeds.parameters())
+    embedding_params = list(self.transformer.wte.parameters())
+    lm_head_params = list(self.lm_head.parameters())
+    resid_params = [self.resid_lambdas]
+    x0_params = [self.x0_lambdas]
+    smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
 
-        engram_params = list(self.engram.parameters())
-        
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(engram_params)
+    # Safely extract Engram parameters (split into embeddings and projections)
+    engram_embed_params = []
+    engram_proj_params = []
+    if hasattr(self, "engram") and self.engram is not None:
+        for name, param in self.engram.named_parameters():
+            if "embd" in name or "embeddings" in name:
+                engram_embed_params.append(param)
+            else:
+                engram_proj_params.append(param)
 
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+    # Verify parameter coverage
+    assert len(list(self.parameters())) == (
+        len(matrix_params) + len(embedding_params) + len(lm_head_params) + 
+        len(value_embeds_params) + len(resid_params) + len(x0_params) + 
+        len(smear_params) + len(engram_embed_params) + len(engram_proj_params)
+    )
 
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=engram_params, lr=matrix_lr * 0.5, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01),
-        ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+    # Scale LR for AdamW parameters ∝ 1 / sqrt(d_model)
+    dmodel_lr_scale = (model_dim / 768) ** -0.5
+    print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
+    # Build param_groups
+    param_groups = [
+        dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+        dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+        dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+        dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+        dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+        dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+    ]
+
+    # Engram Embeddings (AdamW with ZERO weight decay)
+    if engram_embed_params:
+        param_groups.append(
+            dict(kind='adamw', params=engram_embed_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.0)
+        )
+    
+    # Engram Projections (mem_proj, gate_proj)
+    if engram_proj_params:
+        param_groups.append(
+            dict(kind='adamw', params=engram_proj_params, lr=matrix_lr * 0.5, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01)
+        )
+
+    # Muon groups for transformer matrices
+    for shape in sorted({p.shape for p in matrix_params}):
+        group_params = [p for p in matrix_params if p.shape == shape]
+        param_groups.append(dict(
+            kind='muon', params=group_params, lr=matrix_lr,
+            momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+        ))
+
+    optimizer = MuonAdamW(param_groups)
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+    return optimizer
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
