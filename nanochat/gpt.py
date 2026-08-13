@@ -60,7 +60,7 @@ class DeepSeekEngram(nn.Module):
             print(f"⚠️ Warning: '{idf_path}' not found. Initializing with uniform weights (1.0).")
             self.token_idf.fill_(1.0)
 
-    def forward(self, idx, h_layer, kv_cache=None):
+def forward(self, idx, h_layer, kv_cache=None):
         dtype = h_layer.dtype
         B, T = idx.shape
         device = idx.device
@@ -310,7 +310,7 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
-    @torch.no_grad()
+@torch.no_grad()
     def init_weights(self):
         """
         Initialize the full model in this one function for maximum clarity.
