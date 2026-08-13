@@ -305,7 +305,6 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    @torch.no_grad()
     def init_weights(self):
         """
         Initialize the full model in this one function for maximum clarity.
