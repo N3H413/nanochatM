@@ -310,7 +310,7 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
-@torch.no_grad()
+    @torch.no_grad()
     def init_weights(self):
         """
         Initialize the full model in this one function for maximum clarity.
