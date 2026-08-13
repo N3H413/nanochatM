@@ -61,6 +61,7 @@ class DeepSeekEngram(nn.Module):
             self.token_idf.fill_(1.0)
 
     def forward(self, idx, h_layer, kv_cache=None):
+        dtype = h_layer.dtype
         B, T = idx.shape
         device = idx.device
 
@@ -94,13 +95,18 @@ class DeepSeekEngram(nn.Module):
         e_2gram = self.bigram_embd(bigram_hash)
         e_3gram = self.trigram_embd(trigram_hash)
 
-        # Sum N-gram embeddings
-        e_t = e_1gram + e_2gram + e_3gram
+        # Sum N-gram embeddings and cast to activation dtype
+        e_t = (e_1gram + e_2gram + e_3gram).to(dtype=dtype)
+
+        # Ensure linear projections match activation dtype
+        if self.mem_proj.weight.dtype != dtype:
+            self.mem_proj = self.mem_proj.to(dtype)
+        if self.gate_proj.weight.dtype != dtype:
+            self.gate_proj = self.gate_proj.to(dtype)
+
         memory_features = self.mem_proj(e_t)
 
         # --- MAX-POOLED N-GRAM IDF MASK ---
-        # Instead of using only current_idx IDF, pool IDF across the window
-        # so ('log', 'it') takes max(IDF('log'), IDF('it'))
         idf_0 = self.token_idf[current_idx]
         idf_1 = self.token_idf[current_m1]
         idf_2 = self.token_idf[current_m2]
@@ -109,7 +115,7 @@ class DeepSeekEngram(nn.Module):
         
         shifted_idf = torch.clamp(pooled_idf - self.noise_floor, min=0.0)
         scale_factor = 1.0 - self.noise_floor
-        scaled_idf = (shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)).to(dtype=h_layer.dtype)
+        scaled_idf = (shifted_idf / (scale_factor if scale_factor > 0 else 1e-8)).to(dtype=dtype)
 
         # Apply IDF prior scale
         memory_features = memory_features * scaled_idf
@@ -363,6 +369,10 @@ class GPT(nn.Module):
             torch.nn.init.xavier_uniform_(self.engram.mem_proj.weight)
             torch.nn.init.zeros_(self.engram.gate_proj.weight)
             torch.nn.init.zeros_(self.engram.gate_proj.bias)
+
+            # Cast linear projection layers in Engram to COMPUTE_DTYPE
+            self.engram.mem_proj.to(dtype=COMPUTE_DTYPE)
+            self.engram.gate_proj.to(dtype=COMPUTE_DTYPE)
 
             # Load IDF weights if method exists
             if hasattr(self.engram, "load_idf"):
