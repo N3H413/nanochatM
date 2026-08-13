@@ -60,7 +60,7 @@ class DeepSeekEngram(nn.Module):
             print(f"⚠️ Warning: '{idf_path}' not found. Initializing with uniform weights (1.0).")
             self.token_idf.fill_(1.0)
 
-def forward(self, idx, h_layer, kv_cache=None):
+    def forward(self, idx, h_layer, kv_cache=None):
         dtype = h_layer.dtype
         B, T = idx.shape
         device = idx.device
