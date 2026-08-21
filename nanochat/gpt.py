@@ -451,7 +451,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
 
-        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size)        
+        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size, table_size=8191)        
         
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
