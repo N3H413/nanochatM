@@ -813,7 +813,7 @@ class GPT(nn.Module):
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             # INJECT ENGRAM HERE:
-            if i == 2 and hasattr(self, "engram") and self.engram is not None:
+            if i == 2 and hasattr(self, "engram") and self.engram is not None and getattr(self, "engram_enabled", True):
                 x = self.engram(idx, x, kv_cache=kv_cache)
             
             if i == backout_layer:
