@@ -451,7 +451,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
 
-        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size, table_size=8191)
+        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size)
+        # Env-var driven ablation switch: set NANOCHAT_ENGRAM_ENABLED=0 before launching
+        # base_train.py to train a clean no-engram baseline, without editing this file.
+        # Defaults to enabled so existing runs/commands are unaffected.
         self.engram_enabled = os.environ.get("NANOCHAT_ENGRAM_ENABLED", "1") == "1"
         
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
@@ -707,21 +710,31 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
 
-        # Safely extract Engram parameters (split into embeddings and projections)
+        # Safely extract Engram parameters (split into embeddings and projections).
+        # If engram is disabled, its parameters never participate in forward(), so
+        # their .grad stays None after backward() -- the fused AdamW kernel below
+        # can't handle that. Simplest fix: don't hand them to the optimizer at all
+        # when engram is disabled, since there's nothing to train there anyway.
         engram_embed_params = []
         engram_proj_params = []
-        if hasattr(self, "engram") and self.engram is not None:
+        if hasattr(self, "engram") and self.engram is not None and getattr(self, "engram_enabled", True):
             for name, param in self.engram.named_parameters():
                 if "embd" in name or "embeddings" in name:
                     engram_embed_params.append(param)
                 else:
                     engram_proj_params.append(param)
 
-        # Verify parameter coverage
+        # Verify parameter coverage. When engram is disabled, its parameters are
+        # deliberately excluded above, so they're excluded here too.
+        if hasattr(self, "engram") and self.engram is not None and not getattr(self, "engram_enabled", True):
+            uncovered_engram_params = len(list(self.engram.parameters()))
+        else:
+            uncovered_engram_params = 0
         assert len(list(self.parameters())) == (
             len(matrix_params) + len(embedding_params) + len(lm_head_params) + 
             len(value_embeds_params) + len(resid_params) + len(x0_params) + 
-            len(smear_params) + len(engram_embed_params) + len(engram_proj_params)
+            len(smear_params) + len(engram_embed_params) + len(engram_proj_params) +
+            uncovered_engram_params
         )
 
         # Scale LR for AdamW parameters ∝ 1 / sqrt(d_model)
