@@ -451,7 +451,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
 
-        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size)
+        self.engram = DeepSeekEngram(d_model=config.n_embd, vocab_size=padded_vocab_size, table_size=8191)
         # Env-var driven ablation switch: set NANOCHAT_ENGRAM_ENABLED=0 before launching
         # base_train.py to train a clean no-engram baseline, without editing this file.
         # Defaults to enabled so existing runs/commands are unaffected.
